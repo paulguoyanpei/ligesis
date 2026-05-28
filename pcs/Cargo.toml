@@ -1,0 +1,10 @@
+[package]
+name = "pcs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+p3-dft.workspace = true
+p3-field.workspace = true
+p3-goldilocks.workspace = true
+utils.workspace = true

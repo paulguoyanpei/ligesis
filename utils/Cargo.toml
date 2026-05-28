@@ -1,0 +1,12 @@
+[package]
+name = "utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3.workspace = true
+p3-dft.workspace = true
+p3-field.workspace = true
+p3-goldilocks.workspace = true
+rand.workspace = true
+rs_merkle.workspace = true
