@@ -19,10 +19,11 @@ impl<F: Field> MlPoly<F> {
 
     pub fn split(&self, n: usize) -> Vec<MlPoly<F>> {
         assert_eq!(n & (n - 1), 0);
-        let mut polies = (0..n).map(|_| vec![]).collect::<Vec<_>>();
         let len = self.0.len();
-        for i in (0..len).step_by(n) {
-            for j in 0..n {
+        let num_chunks = len / n;
+        let mut polies = (0..num_chunks).map(|_| vec![]).collect::<Vec<_>>();
+        for i in (0..len).step_by(num_chunks) {
+            for j in 0..num_chunks {
                 polies[j].push(self.0[i + j]);
             }
         }

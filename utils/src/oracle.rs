@@ -2,7 +2,7 @@ use p3_field::Field;
 use rand::distr::{Distribution, StandardUniform};
 use rand::{Rng, RngExt};
 
-pub const RANDOM_ORACLE_LEN: usize = 1000;
+pub const RANDOM_ORACLE_LEN: usize = 100_000;
 
 pub struct RandomOracle<F: Field> {
     fields: Vec<F>,

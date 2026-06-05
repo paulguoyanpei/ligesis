@@ -471,6 +471,7 @@ dependencies = [
  "p3-dft",
  "p3-field",
  "p3-goldilocks",
+ "rand",
  "utils",
 ]
 

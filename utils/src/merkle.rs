@@ -26,6 +26,17 @@ impl Serialize {
             .into_iter()
             .collect()
     }
+
+    /// Append the serialized bytes of `v` to `out`, reusing its allocation. Lets a caller
+    /// build many leaves into one reusable buffer instead of allocating a `Vec` per leaf.
+    pub fn serialize_fields_into<F: Field>(v: &[F], out: &mut Vec<u8>) {
+        out.extend(<F as RawDataSerializable>::into_byte_stream(v.iter().copied()));
+    }
+}
+
+/// Hash one leaf's bytes with the Merkle tree's hash function.
+pub fn hash_leaf(bytes: &[u8]) -> <Blake32 as Hasher>::Hash {
+    Blake32::hash(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +51,17 @@ impl MerkleTreeProver {
             .iter()
             .map(|x| Blake32::hash(x))
             .collect::<Vec<_>>();
-        let merkle_tree = MerkleTree::<Blake32>::from_leaves(&leaves);
+        Self::from_leaf_hashes(leaves)
+    }
+
+    /// Build the tree from precomputed leaf hashes (i.e. each `Blake32::hash(leaf_bytes)`).
+    /// Lets callers fuse leaf serialization and hashing without materializing the leaf bytes.
+    pub fn from_leaf_hashes(leaf_hashes: Vec<<Blake32 as Hasher>::Hash>) -> Self {
+        let leave_num = leaf_hashes.len();
+        let merkle_tree = MerkleTree::<Blake32>::from_leaves(&leaf_hashes);
         Self {
             merkle_tree,
-            leave_num: leaf_values.len(),
+            leave_num,
         }
     }
 

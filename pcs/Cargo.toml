@@ -7,4 +7,20 @@ edition.workspace = true
 p3-dft.workspace = true
 p3-field.workspace = true
 p3-goldilocks.workspace = true
+rand.workspace = true
 utils.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[[bench]]
+name = "basefold"
+harness = false
+
+[[bench]]
+name = "ligesis"
+harness = false
+
+[[bench]]
+name = "sumcheck"
+harness = false
