@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "logup",
     "pcs",
+    "proofsys",
     "utils",
 ]
 resolver = "3"
@@ -17,3 +19,4 @@ p3-goldilocks = "0.5.3"
 rs_merkle = "1.5.0"
 rand = "0.10.1"
 utils = { path = "utils" }
+logup = { path = "logup" }

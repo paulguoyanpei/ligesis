@@ -1,0 +1,17 @@
+[package]
+name = "logup"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+p3-field.workspace = true
+utils.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+p3-goldilocks.workspace = true
+pcs = { path = "../pcs" }
+
+[[bench]]
+name = "logup"
+harness = false

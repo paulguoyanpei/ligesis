@@ -53,6 +53,24 @@ pub struct BasefoldProverState<LF: Field, EF: Field> {
     log_interleave: usize,
 }
 
+impl<LF: Field, EF: Field> BasefoldProverState<LF, EF> {
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    pub fn log_interleave(&self) -> usize {
+        self.log_interleave
+    }
+
+    pub fn code_rate(&self) -> usize {
+        self.code_rate
+    }
+
+    pub fn eval(&self, point: &[EF]) -> EF {
+        self.poly.clone().eval(point)
+    }
+}
+
 pub struct BasefoldCommit(pub [u8; 32]);
 
 /// A Merkle opening at one oracle level: the proof bytes plus the revealed leaves
@@ -64,8 +82,11 @@ pub struct RoundOpening<F: Field> {
 }
 
 pub struct BasefoldProof<LF: Field, EF: Field> {
-    /// One field element `l_i(0)` per evaluation-reduction round (`num_vars - LOG_INTERLEAVE` of them).
-    reduction_msgs: Vec<EF>,
+    /// The two round-polynomial evals `(l_i(0), l_i(1))` per evaluation-reduction round
+    /// (`num_vars - LOG_INTERLEAVE` of them). Sending both (rather than only `l_i(0)` and
+    /// reconstructing `l_i(1)` from the claim) lets the opening point be **any** point,
+    /// including ones with `0`/`1` coordinates (e.g. structured reshape/limb points).
+    reduction_msgs: Vec<(EF, EF)>,
     /// Merkle roots of the intermediate folded oracles (levels `1..R`, the final level is
     /// sent in the clear as `final_codeword`).
     fold_roots: Vec<[u8; 32]>,
@@ -98,7 +119,7 @@ impl<LF: Field, EF: Field> BasefoldProof<LF, EF> {
     pub fn size_bytes(&self) -> usize {
         let lf = core::mem::size_of::<LF>();
         let ef = core::mem::size_of::<EF>();
-        let mut s = self.reduction_msgs.len() * ef
+        let mut s = self.reduction_msgs.len() * 2 * ef
             + self.fold_roots.len() * 32
             + self.final_codeword.len() * ef
             + ef;
@@ -292,6 +313,20 @@ where
         Self::commit_base_on_domain(poly, code_rate, LOG_INTERLEAVE)
     }
 
+    /// Commit a same-domain family of base-field MLEs. Each polynomial retains its own Merkle
+    /// root and prover state; batching here shares the caller-visible setup and avoids forcing
+    /// users to duplicate the domain parameters before the later `batch_prove` call.
+    pub fn batch_commit_base_on_domain(
+        polies: Vec<MlPoly<BF>>,
+        code_rate: usize,
+        log_interleave: usize,
+    ) -> Vec<(BasefoldProverState<BF, EF>, BasefoldCommit)> {
+        polies
+            .into_iter()
+            .map(|poly| Self::commit_base_on_domain(poly, code_rate, log_interleave))
+            .collect()
+    }
+
     pub fn commit_ext(
         poly: MlPoly<EF>,
         code_rate: usize,
@@ -395,7 +430,7 @@ where
             let l0 = MlPoly(m0).eval(rest);
             let l1 = MlPoly(m1).eval(rest);
             debug_assert_eq!((EF::ONE - zp[round]) * l0 + zp[round] * l1, y);
-            reduction_msgs.push(l0);
+            reduction_msgs.push((l0, l1));
 
             let r = oracle.next_field();
             challenges.push(r);
@@ -505,14 +540,13 @@ where
         let mut y = proof.claimed_eval;
         let mut challenges = Vec::with_capacity(rounds);
         for round in 0..rounds {
-            let l0 = proof.reduction_msgs[round];
+            let (l0, l1) = proof.reduction_msgs[round];
             let zi = zp[round];
-            if zi == EF::ZERO {
-                // l_i(z_i)=l_i(0)=y fixes l_i(0) but not the slope; cannot reconstruct.
-                // RandomOracle points are effectively never zero, but bail safely.
+            // The round polynomial l_i(X) = (1−X)l0 + X·l1 must agree with the running claim at
+            // z_i; valid at any z_i (including 0/1), since both evals are sent.
+            if (EF::ONE - zi) * l0 + zi * l1 != y {
                 return false;
             }
-            let l1 = (y - (EF::ONE - zi) * l0) * zi.inverse();
             let r = oracle.next_field();
             challenges.push(r);
             y = (EF::ONE - r) * l0 + r * l1;
@@ -1100,7 +1134,7 @@ mod tests {
         let mut proof =
             Basefold::<Goldilocks, GoldilocksExt2>::prove(&state, point.clone(), &mut oracle);
 
-        proof.reduction_msgs[0] += GoldilocksExt2::ONE;
+        proof.reduction_msgs[0].0 += GoldilocksExt2::ONE;
 
         oracle.restart();
         assert!(!Basefold::<Goldilocks, GoldilocksExt2>::verify(
