@@ -205,18 +205,6 @@ impl ModelWeights {
         })
     }
 
-    pub fn x0_from_input_ids(&self, input_ids: &[i64], config: &Config) -> Matrix {
-        assert_eq!(input_ids.len(), config.n_seq);
-        let mut out = Matrix::zeros(config.n_seq, config.d_model);
-        for (pos, &tok) in input_ids.iter().enumerate() {
-            let tok = tok as usize;
-            for d in 0..config.d_model {
-                out.set(pos, d, self.wte.get(tok, d) + self.wpe.get(pos, d));
-            }
-        }
-        out
-    }
-
     pub fn forward(&self, x0: Matrix, config: &Config) -> Witness {
         assert_eq!(x0.rows(), config.n_seq);
         assert_eq!(x0.cols(), config.d_model);

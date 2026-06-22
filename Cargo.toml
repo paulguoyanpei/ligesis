@@ -20,3 +20,4 @@ rs_merkle = "1.5.0"
 rand = "0.10.1"
 utils = { path = "utils" }
 logup = { path = "logup" }
+pcs = { path = "pcs" }

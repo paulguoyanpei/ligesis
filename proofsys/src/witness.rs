@@ -87,90 +87,11 @@ pub struct Witness {
     pub q_log: Matrix,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MergedPolys {
-    pub std: Vec<i64>,
-    pub q_qkv: Vec<i64>,
-    pub q_sc: Vec<i64>,
-    pub x_max: Vec<i64>,
-    pub exp: Vec<i64>,
-    pub q_prob: Vec<i64>,
-    pub q_ao: Vec<i64>,
-    pub q_fc: Vec<i64>,
-    pub act: Vec<i64>,
-}
-
-impl Witness {
-    pub fn logits(&self) -> &Matrix {
-        &self.q_log
-    }
-
-    pub fn merged_polys(&self) -> MergedPolys {
-        let mut std = Vec::new();
-        let mut q_qkv = Vec::new();
-        let mut q_sc = Vec::new();
-        let mut x_max = Vec::new();
-        let mut exp = Vec::new();
-        let mut q_prob = Vec::new();
-        let mut q_ao = Vec::new();
-        let mut q_fc = Vec::new();
-        let mut act = Vec::new();
-
-        for block in &self.blocks {
-            push_ln(&block.ln1, &mut std);
-            q_qkv.extend(block.attention.q_qkv.data());
-            for scores in &block.attention.scores {
-                q_sc.extend(scores.data());
-            }
-            for x in &block.attention.x_max {
-                x_max.extend(x.data());
-            }
-            for e in &block.attention.exp {
-                exp.extend(e.data());
-            }
-            for p in &block.attention.q_prob {
-                q_prob.extend(p.data());
-            }
-            q_ao.extend(block.attention.q_ao.data());
-
-            push_ln(&block.ln2, &mut std);
-            q_fc.extend(block.mlp.q_fc.data());
-            act.extend(block.mlp.act.data());
-        }
-        push_ln(&self.lnf, &mut std);
-
-        MergedPolys {
-            std: pad_power_of_two(std),
-            q_qkv: pad_power_of_two(q_qkv),
-            q_sc: pad_power_of_two(q_sc),
-            x_max: pad_power_of_two(x_max),
-            exp: pad_power_of_two(exp),
-            q_prob: pad_power_of_two(q_prob),
-            q_ao: pad_power_of_two(q_ao),
-            q_fc: pad_power_of_two(q_fc),
-            act: pad_power_of_two(act),
-        }
-    }
-}
-
-fn push_ln(ln: &LayerNormWitness, std: &mut Vec<i64>) {
-    std.extend(&ln.std);
-}
-
-pub fn pad_power_of_two(mut values: Vec<i64>) -> Vec<i64> {
-    let len = values.len().max(1).next_power_of_two();
-    values.resize(len, 0);
-    values
-}
-
+/// Encode a signed integer into Goldilocks (negatives as the additive inverse).
 pub fn encode_i64(x: i64) -> Goldilocks {
     if x >= 0 {
         Goldilocks::new(x as u64)
     } else {
         -Goldilocks::new(x.unsigned_abs())
     }
-}
-
-pub fn encode_poly(values: &[i64]) -> Vec<Goldilocks> {
-    values.iter().map(|&x| encode_i64(x)).collect()
 }

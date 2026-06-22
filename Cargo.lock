@@ -518,6 +518,7 @@ dependencies = [
  "logup",
  "p3-field",
  "p3-goldilocks",
+ "pcs",
  "rand",
  "utils",
 ]
