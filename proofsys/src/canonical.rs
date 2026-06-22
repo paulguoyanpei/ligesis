@@ -381,15 +381,8 @@ mod tests {
             elem.push(if (row >> bit) & 1 == 1 { EF::ONE } else { EF::ZERO });
         }
         let point = instance_slice_point(&elem, 1, lay.inst_vars());
-        let poly = MlPoly(
-            canon
-                .set
-                .commitment(Q_LN)
-                .unwrap()
-                .0
-                 .0
-                .clone(),
-        );
+        // Read the committed evaluations from the prover data (the no-op commitment carries none).
+        let poly = MlPoly(canon.set.prover_data(Q_LN).unwrap().0.clone());
         assert_eq!(poly.eval(&point), ef(ln2.quotient.get(row, col)));
     }
 }

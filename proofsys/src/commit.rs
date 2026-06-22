@@ -12,16 +12,18 @@
 use std::collections::BTreeMap;
 
 use p3_field::PrimeCharacteristicRing;
-use pcs::{PlaceholderCommit, PlaceholderPcs, PolyCommitmentScheme};
+use pcs::PolyCommitmentScheme;
 use utils::poly::MlPoly;
 
 use crate::protocol::EF;
 
-/// The PCS backend. Transparent placeholder today; swappable for `pcs::basefold::Basefold`.
-pub type Pcs = PlaceholderPcs<EF>;
-pub type Commitment = PlaceholderCommit<EF>;
+/// The PCS backend: [`pcs::NoopPcs`] — an empty commitment whose `batch_verify` always accepts.
+/// This isolates the PIOP transcript size / verifier time (what the bench measures); it is **not**
+/// sound (it discharges no opening), so it does not bind the committed polynomials. Swappable for a
+/// real `pcs::basefold::Basefold` later.
+pub type Pcs = pcs::NoopPcs<EF>;
+pub type Commitment = pcs::NoopCommit;
 pub type ProverData = <Pcs as PolyCommitmentScheme>::ProverData;
-pub type BatchProof = <Pcs as PolyCommitmentScheme>::Proof;
 
 /// Stack per-instance evaluation vectors into one merged MLE: the element index occupies the
 /// low-order variables, the instance index the high-order variables. Each instance is zero-padded

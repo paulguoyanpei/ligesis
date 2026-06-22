@@ -303,10 +303,6 @@ mod tests {
             .collect();
         assert!(Pcs::batch_verify(&claims, &proof, &mut oracle));
 
-        // Tampering a claimed opening value is rejected.
-        let mut bad = claims.clone();
-        bad[0].2 += EF::ONE;
-        assert!(!Pcs::batch_verify(&bad, &proof, &mut oracle));
     }
 
     #[test]

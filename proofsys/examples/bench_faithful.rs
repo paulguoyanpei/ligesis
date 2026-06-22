@@ -34,13 +34,20 @@ fn main() {
         config.n_layer, config.n_head, config.d_model, config.n_seq, config.vocab
     );
 
+    // Offline commitments (weights + public table) are data-independent — commit them before the
+    // forward pass so they can be amortized / reused across inferences.
+    let t = Instant::now();
+    let offline = faithful::build_offline_commitments(&config, &weights);
+    let offline_commit_ms = t.elapsed().as_secs_f64() * 1000.0;
+
     let t = Instant::now();
     let witness = weights.forward(x0, &config);
     let fwd_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    // Online commitments (witness types + limbs + multiplicity) on top of the offline set.
     let t = Instant::now();
-    let canon = faithful::build_commitments(&config, &weights, &witness);
-    let commit_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let canon = faithful::build_online_commitments(offline, &config, &weights, &witness);
+    let online_commit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let mut rng = rand::rng();
     let mut oracle = RandomOracle::<EF>::new(&mut rng);
@@ -54,15 +61,60 @@ fn main() {
     let ok = faithful::verify(&canon.set, &config, &weights, &proof, &mut oracle);
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    println!("offline_commit_ms={offline_commit_ms:.3}");
     println!("forward_ms={fwd_ms:.3}");
-    println!("commit_ms={commit_ms:.3}");
+    println!("online_commit_ms={online_commit_ms:.3}");
     println!("prove_ms={prove_ms:.3}");
     println!("verify_ms={verify_ms:.3}");
     println!("transcript_size_bytes={}", proof.size_bytes());
+    print_size_breakdown(&proof);
     println!("num_segments={}", proof.segment_openings.len());
     println!("fiat_shamir_field_challenges={fs_field}");
     println!("fiat_shamir_int_challenges={fs_int}");
     println!("verify_ok={ok}");
+    assert!(ok, "faithful verify failed");
+}
+
+/// Break the transcript size down by component (mirrors `UnifiedProof::size_bytes`).
+fn print_size_breakdown(proof: &faithful::UnifiedProof) {
+    let ef = core::mem::size_of::<EF>();
+
+    // 1. Unified lookup (the two GKR fraction-sum passes: queries + table).
+    let lookup = proof.lookup.size_bytes();
+
+    // 2-3. Per-segment: matmul sumchecks + scalar openings.
+    let (mut seg_matmul, mut seg_scalars) = (0usize, 0);
+    for so in &proof.segment_openings {
+        seg_scalars += ef * (1 + so.out_value.is_some() as usize); // in_value (+ out_value)
+        seg_scalars += ef * so.linear_openings.len();
+        if let Some(m) = &so.matmul {
+            seg_matmul += m.proof.size_bytes() + ef; // sumcheck + claimed_eval
+        }
+    }
+
+    // 4. Batched Type-B softmax-division product (per-head evals + one sumcheck).
+    let typeb = proof.typeb.size_bytes();
+
+    // 5. Limb recomposition checks (prod sumcheck + linear/limb openings).
+    let mut recomp = 0usize;
+    for r in &proof.recomps {
+        if let Some(p) = &r.prod {
+            recomp += p.proof.size_bytes() + ef;
+        }
+        recomp += ef * (r.openings.len() + r.limb_values.len());
+    }
+
+    // 6. Table column openings at z_t.
+    let table_cols = 3 * ef;
+
+    let total = lookup + seg_matmul + typeb + seg_scalars + recomp + table_cols;
+    let pct = |x: usize| 100.0 * x as f64 / total as f64;
+    println!("  size_lookup_gkr_bytes={lookup} ({:.1}%)", pct(lookup));
+    println!("  size_segment_matmul_bytes={seg_matmul} ({:.1}%)", pct(seg_matmul));
+    println!("  size_typeb_batched_prod_bytes={typeb} ({:.1}%)", pct(typeb));
+    println!("  size_segment_scalar_openings_bytes={seg_scalars} ({:.1}%)", pct(seg_scalars));
+    println!("  size_limb_recomp_bytes={recomp} ({:.1}%)", pct(recomp));
+    println!("  size_table_col_openings_bytes={table_cols} ({:.1}%)", pct(table_cols));
 }
 
 fn load_real(dir: &str) -> Option<(String, Config, ModelWeights, Matrix)> {

@@ -1,9 +1,9 @@
 pub mod basefold;
 pub mod ligesis;
-pub mod scheme;
+pub mod noop;
 pub mod subset_sum;
 
-pub use scheme::{PlaceholderCommit, PlaceholderPcs, PolyCommitmentScheme};
+pub use noop::{NoopCommit, NoopPcs, PolyCommitmentScheme};
 
 #[cfg(test)]
 mod tests {
