@@ -1,0 +1,12 @@
+[package]
+name = "proofsys"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+logup.workspace = true
+pcs.workspace = true
+p3-field.workspace = true
+p3-goldilocks.workspace = true
+rand.workspace = true
+utils.workspace = true

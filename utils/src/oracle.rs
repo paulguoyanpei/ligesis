@@ -2,7 +2,10 @@ use p3_field::Field;
 use rand::distr::{Distribution, StandardUniform};
 use rand::{Rng, RngExt};
 
-pub const RANDOM_ORACLE_LEN: usize = 100_000;
+/// Pre-generated Fiat-Shamir randomness length. Sized for a full 12-layer GPT-2 inference
+/// proof, whose nested fraction-sum / sumcheck transcript draws a few hundred thousand
+/// challenges (a single gadget needs only a few thousand).
+pub const RANDOM_ORACLE_LEN: usize = 4_000_000;
 
 pub struct RandomOracle<F: Field> {
     fields: Vec<F>,
@@ -48,6 +51,11 @@ impl<F: Field> RandomOracle<F> {
         let res = self.ints[self.ints_idx..(self.ints_idx + n)].to_vec();
         self.ints_idx += n;
         res
+    }
+
+    /// Number of `(field, int)` challenges drawn so far — for measuring transcript cost.
+    pub fn drawn(&self) -> (usize, usize) {
+        (self.fields_idx, self.ints_idx)
     }
 
     pub fn restart(&mut self) {

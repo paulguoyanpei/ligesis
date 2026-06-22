@@ -1,13 +1,20 @@
 # ligesis
 
-A Rust implementation of **code-based multilinear polynomial commitment schemes (PCS)** over
-[Goldilocks](https://docs.rs/p3-goldilocks): a standalone **Basefold** PCS, and **LigeSIS** — a
-Ligero-style RS-code PCS whose column digests are committed with a subset-sum (binary-SIS) hash.
-LigeSIS follows the single-machine **Protocol 1** of the paper [`LigeSIS_SP27.pdf`](LigeSIS_SP27.pdf).
+A Rust workspace for **code-based multilinear polynomial commitment schemes (PCS)** over
+[Goldilocks](https://docs.rs/p3-goldilocks) and a **faithful zk-PIOP for integer GPT-2 inference**
+built on top of them.
+
+- **`pcs`** — multilinear PCS over Goldilocks: a standalone **Basefold** (FRI-style); **LigeSIS** —
+  a Ligero-style RS-code PCS whose column digests are committed with a subset-sum (binary-SIS) hash,
+  following the single-machine **Protocol 1** of [`LigeSIS_SP27.pdf`](LigeSIS_SP27.pdf); and a
+  small **`PolyCommitmentScheme` interface** with a transparent placeholder backend.
+- **`logup`** — a GKR-LogUp lookup (log-derivative argument), the network-wide table lookup.
+- **`proofsys`** — proves one integer GPT-2 inference as a **commit → reduce → batch-open** PIOP
+  over the PCS interface (see [proofsys](#proofsys--faithful-gpt-2-piop) below).
 
 > Research/experimental code. The Fiat–Shamir transcript is a precomputed randomness oracle
 > (`RandomOracle`), not a hash-absorbing transcript; soundness parameters are set for structure,
-> not tuned to the paper's proven bounds. Single-machine only (the distributed protocol is not
+> not tuned to proven bounds. Single-machine only (the distributed LigeSIS protocol is not
 > implemented).
 
 ## Layout
@@ -19,10 +26,20 @@ utils/                shared primitives
   src/merkle.rs       Blake3 Merkle tree (rs_merkle) + field serialization
   src/oracle.rs       RandomOracle<F> — precomputed Fiat–Shamir stand-in
 pcs/
+  src/scheme.rs       PolyCommitmentScheme trait + transparent PlaceholderPcs
   src/basefold.rs     Basefold PCS: commit / prove / verify + shared-domain batched open
   src/subset_sum.rs   SubsetSumHash — H = A·B, the binary-SIS hash (C = 32 digest rows)
   src/ligesis.rs      LigeSIS PCS: setup / commit / prove / verify
   benches/            single-threaded wall-clock benches (basefold, ligesis, sumcheck)
+logup/
+  src/lookup.rs       GKR-LogUp lookup: two fraction-sum passes + cross-multiply
+proofsys/             faithful PIOP for integer GPT-2 inference (commit → reduce → batch-open)
+  src/model.rs        integer GPT-2 forward pass — the witness generator
+  src/canonical.rs    one merged commitment per witness type (+ offline weights)
+  src/commit.rs       canonical layout, OracleSource point-maps, claim accumulator, CommitSet
+  src/reduce.rs       matmul (Thaler13) + eq-product sumcheck reductions → opening claims
+  src/faithful.rs     unified lookup + all gadget reductions; prove / verify
+  examples/bench_faithful.rs   end-to-end forward → commit → prove → verify benchmark
 ```
 
 ## Build, test, bench
@@ -32,9 +49,13 @@ single-threaded).
 
 ```sh
 cargo build
-cargo test  -p pcs -- --test-threads=1      # round-trip + tamper tests
+cargo test  -p pcs -- --test-threads=1      # PCS round-trip + tamper tests
 cargo bench -p pcs --bench basefold         # Basefold commit/eval/verify + proof size
 cargo bench -p pcs --bench ligesis          # LigeSIS commit/eval/verify + proof size
+
+cargo test  -p proofsys                     # PIOP reductions + accept/tamper tests
+cargo run --release -p proofsys --example bench_faithful            # synthetic config
+cargo run --release -p proofsys --example bench_faithful -- ../int_gpt/export   # real GPT-2
 ```
 
 ## Parameters
@@ -88,7 +109,45 @@ See [`pcs/src/ligesis.rs`](pcs/src/ligesis.rs) (module docs) for the full protoc
   machine, so the lookup isn't needed). This also removes `H` from the FRI batch, which lifts the
   shape restriction below.
 
-## Benchmarks (indicative)
+## proofsys — faithful GPT-2 PIOP
+
+`proofsys` proves one integer GPT-2 inference (the `int_gpt` fixed-point model) as a **faithful**
+PIOP over the PCS interface: the prover commits the witness **once**, every sumcheck and a single
+network-wide LogUp lookup reduce to **opening claims** against those commitments (committing nothing
+more), and all claims are discharged by one **PCS batch-open** at the end. The committed witness set
+is the single source of truth; every other polynomial — matmul products, division remainders,
+reshapes/transposes, the residual stream — is *virtual*, reconstructed at the queried point from
+opened values + public data (no extra commitments).
+
+The PCS is pluggable through `pcs::PolyCommitmentScheme`. The current backend is the transparent
+**`PlaceholderPcs`** (commit = ship the polynomial, open = the verifier re-evaluates it, empty
+proof), so the whole architecture is testable end-to-end; swapping in `Basefold::batch_prove` is a
+localized change since every gadget already emits `(commitment, point, value)` claims.
+
+**Reductions** (batched across the 12 layers / 144 heads via per-instance segments):
+- **matmul** — Thaler13 `C̃(z) = Σ_k Ã·B̃`, one sumcheck over the contraction, fused with the
+  following rescale; the product `C` is never committed. Operands resolve to canonical openings via
+  affine / head-slice / weight point-maps (all 7 GPT-2 matmuls, regular and transposed).
+- **division** — Euclidean `a = q·b + r`: commit only `q`, range-check `r` and `b−1−r`. Constant
+  divisors (`//SCALE`, `//(√D·SCALE)`) hit a range table directly; the witness divisor (`//std`)
+  and the ≈2³⁰ LayerNorm remainder are **limb-decomposed** (16-bit limbs vs a shared 2¹⁶ table, plus
+  a recomposition check). Every committed quotient also carries a limb quotient bound.
+- **sqrt** — `y²−y ≤ x ≤ y²+y` via an eq-weighted product (`y²`) and limb brackets.
+- **gelu** — indexed LUT (`act = GELU_LUT[fc + offset]`).
+- **unified lookup** — every range / LUT / limb query folds into **one** LogUp lookup against a
+  single `(in, out, type)` table; only the multiplicity vector `e` is committed online, the table
+  side is public and verifier-reconstructed. The table is sized to the config.
+
+`model::forward` is the bit-exact integer reference that generates the witness. The pipeline
+(forward → commit → prove → verify) verifies on small and multi-layer/-head configs;
+`bench_faithful` reports prover/verifier time, transcript size, and Fiat-Shamir draw counts.
+
+> Status: the reductions above are implemented and accept/tamper-tested. Not yet wired (the
+> remaining soundness bindings): the softmax-max grand-product, the exp masked-index LUT, the
+> sum-over-features half-points / `var_sum` binding, and the residual-stream wiring. Full-scale
+> GPT-2 (12 layers, vocab 50257) is being brought up; small and multi-instance configs pass today.
+
+## PCS benchmarks (indicative)
 
 Single-threaded; numbers vary with machine load (commit is dominated by the un-accelerated
 subset-sum hash and swings run-to-run). `Basefold` opens the full `2^μ` polynomial; `LigeSIS` rows
