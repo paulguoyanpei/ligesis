@@ -560,17 +560,24 @@ fn instance_block(set: &CommitSet, oracle: &str, inst: usize, config: &Config) -
 /// Evaluate an `OracleSource` at boolean vertex `i` of a `vars`-variable value cube: index the
 /// committed poly at the mapped boolean point and add the public bias.
 fn source_at_index(src: &OracleSource, set: &CommitSet, i: usize, vars: usize) -> EF {
-    let bits: Vec<EF> = (0..vars)
-        .map(|b| if (i >> b) & 1 == 1 { EF::ONE } else { EF::ZERO })
-        .collect();
-    let mapped = src.map.apply(&bits);
+    // At a boolean vertex the mapped point is boolean, so `map.apply` + the `== ONE` scan is just an
+    // integer index: a `Const(true)`/`Var(j)`-with-bit-set coord sets index bit `b`. Compute it
+    // directly — no per-vertex `Vec<EF>` allocations.
     let mut idx = 0usize;
-    for (b, &v) in mapped.iter().enumerate() {
-        if v == EF::ONE {
+    for (b, coord) in src.map.0.iter().enumerate() {
+        let bit = match *coord {
+            Coord::Const(v) => v,
+            Coord::Var(j) => (i >> j) & 1 == 1,
+        };
+        if bit {
             idx |= 1 << b;
         }
     }
-    set.prover_data(&src.oracle).unwrap().0[idx] + src.bias_at(&bits)
+    let mut val = set.prover_data(&src.oracle).unwrap().0[idx];
+    if src.bias.is_some() {
+        val += bias_value_at_index(src.bias.as_ref().unwrap(), i, vars);
+    }
+    val
 }
 
 /// The (non-negative integer) limb-check target at value vertex `i`:
@@ -928,6 +935,23 @@ fn typea_inputs(
     }
 }
 
+/// The rescale-fusion remainder matrix `r = C − divisor·q` for a TypeA matmul instance, in the
+/// matmul *output* layout (row=S, col=mm output). Retained by the forward pass (see
+/// [`crate::witness::AttentionWitness`]), so this is a cheap lookup — no matmul-product recompute.
+fn typea_remainder(op: &TypeAOp, witness: &Witness) -> Matrix {
+    let (l, h) = (op.layer, op.head);
+    let blk = &witness.blocks[l];
+    match op.mm {
+        Mm::Qkv => blk.attention.rem_qkv.clone(),
+        Mm::Fc => blk.mlp.rem_fc.clone(),
+        Mm::Fpr => blk.mlp.rem_fpr.clone(),
+        Mm::Apr => blk.attention.rem_apr.clone(),
+        Mm::Log => witness.rem_log.clone(),
+        Mm::Sc => blk.attention.rem_sc[h].head_matrix(0),
+        Mm::Ao => blk.attention.rem_ao_heads[h].head_matrix(0),
+    }
+}
+
 /// `A@Bᵀ` transposed contraction vectors (`B` stored `col × k`).
 fn contract_transposed(
     a: &Matrix,
@@ -947,19 +971,10 @@ fn contract_transposed(
     (avec, bvec)
 }
 
-/// The product matrix for a matmul of the given kind.
-fn matmul_product(mk: MatmulKind, a: &Matrix, b: &Matrix) -> Matrix {
-    match mk {
-        MatmulKind::Regular => a.matmul(b),
-        MatmulKind::Transposed => a.matmul_transposed_rhs(b),
-    }
-}
-
 /// Compute a segment's `in`/`out`/`table-index` columns (prover side, α-independent).
 fn segment_columns(
     set: &CommitSet,
     config: &Config,
-    weights: &ModelWeights,
     witness: &Witness,
     d: &Descriptor,
 ) -> (Vec<EF>, Vec<EF>, Vec<usize>) {
@@ -981,18 +996,18 @@ fn segment_columns(
                 indices[i] = d.table_base + ef_to_u64(v) as usize;
             }
         }
-        SegKind::TypeA { divisor, op, mk, .. } => {
+        SegKind::TypeA { divisor, op, .. } => {
             // r = C − divisor·q in the matmul *output* layout (row=S, col=mm output; padding ⇒ 0).
-            let (a, b, q) = typea_inputs(op, config, weights, witness);
-            let c = matmul_product(*mk, &a, &b);
+            // The remainder is retained by the forward pass, so no matmul-product recompute here.
+            let rem = typea_remainder(op, witness);
             let col_pow = mm_dims(config, op.mm).col.next_power_of_two();
-            for r in 0..c.rows() {
-                for col in 0..c.cols() {
+            for r in 0..rem.rows() {
+                for col in 0..rem.cols() {
                     let idx = r * col_pow + col;
-                    let rem = c.get(r, col) - *divisor as i64 * q.get(r, col);
-                    debug_assert!((0..*divisor as i64).contains(&rem));
-                    in_vals[idx] = ef_i64(rem);
-                    indices[idx] = d.table_base + rem as usize;
+                    let v = rem.get(r, col);
+                    debug_assert!((0..*divisor as i64).contains(&v));
+                    in_vals[idx] = ef_i64(v);
+                    indices[idx] = d.table_base + v as usize;
                 }
             }
         }
@@ -1015,11 +1030,17 @@ fn segment_columns(
     (in_vals, out_vals, indices)
 }
 
-fn bias_value_at_index(bias: &BiasPoly, i: usize, vars: usize) -> EF {
-    let point: Vec<EF> = (0..vars)
-        .map(|bit| if (i >> bit) & 1 == 1 { EF::ONE } else { EF::ZERO })
-        .collect();
-    bias.eval(&point)
+/// Bias value at boolean vertex `i`. At a boolean point `MlPoly(values).eval` is just an array
+/// index, so select `values[idx]` directly (`idx` packs the bits `i` at the bias's `vars`),
+/// avoiding the per-vertex `values.clone()` + `2^|vars|` eval that dominated commit/query build.
+fn bias_value_at_index(bias: &BiasPoly, i: usize, _vars: usize) -> EF {
+    let mut idx = 0usize;
+    for (k, &var) in bias.vars.iter().enumerate() {
+        if (i >> var) & 1 == 1 {
+            idx |= 1 << k;
+        }
+    }
+    bias.values[idx]
 }
 
 fn multiplicity_counts(
@@ -1032,7 +1053,7 @@ fn multiplicity_counts(
     let total = total_query_len(descs);
     let mut counts = vec![0u64; table_len(config, weights)];
     for d in descs {
-        let (_, _, indices) = segment_columns(set, config, weights, witness, d);
+        let (_, _, indices) = segment_columns(set, config, witness, d);
         for &idx in &indices {
             counts[idx] += 1;
         }
@@ -1069,7 +1090,6 @@ pub fn build_commitments(config: &Config, weights: &ModelWeights, witness: &Witn
 fn build_query(
     set: &CommitSet,
     config: &Config,
-    weights: &ModelWeights,
     witness: &Witness,
     descs: &[Descriptor],
     alpha: EF,
@@ -1078,7 +1098,7 @@ fn build_query(
     let padded = total.next_power_of_two();
     let mut q = vec![EF::ZERO; padded];
     for d in descs {
-        let (in_vals, out_vals, _) = segment_columns(set, config, weights, witness, d);
+        let (in_vals, out_vals, _) = segment_columns(set, config, witness, d);
         for i in 0..d.len() {
             q[d.start + i] = fold_row(alpha, in_vals[i], out_vals[i], d.ty);
         }
@@ -1099,7 +1119,7 @@ pub fn prove(
 ) -> UnifiedProof {
     let descs = descriptors(config, weights);
     let alpha = oracle.next_field();
-    let query = build_query(set, config, weights, witness, &descs, alpha);
+    let query = build_query(set, config, witness, &descs, alpha);
     let table = build_table(alpha, config, weights);
     let e = set.prover_data(E).unwrap().0.clone();
 
@@ -1162,6 +1182,7 @@ pub fn prove(
             linear_openings,
         });
     }
+
     // Limb-recomposition checks (LayerNorm `// std` remainder, sqrt lower bracket) at fresh points.
     let mut recomps = Vec::new();
     for spec in limb_checks(config) {

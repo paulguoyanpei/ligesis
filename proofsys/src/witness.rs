@@ -60,6 +60,12 @@ pub struct AttentionWitness {
     pub q_ao: Matrix,
     pub q_apr: Matrix,
     pub x_out: Matrix,
+    /// Rescale-fusion remainders `r = C − divisor·q` retained from the forward pass so the unified
+    /// lookup's TypeA `in` column needs no matmul-product recompute. Same shapes as the quotients.
+    pub rem_qkv: Matrix,
+    pub rem_sc: Vec<Tensor3>,
+    pub rem_ao_heads: Vec<Tensor3>,
+    pub rem_apr: Matrix,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +75,9 @@ pub struct MlpWitness {
     pub act: Matrix,
     pub q_fpr: Matrix,
     pub x_out: Matrix,
+    /// Rescale-fusion remainders (see [`AttentionWitness`]).
+    pub rem_fc: Matrix,
+    pub rem_fpr: Matrix,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +94,8 @@ pub struct Witness {
     pub blocks: Vec<BlockWitness>,
     pub lnf: LayerNormWitness,
     pub q_log: Matrix,
+    /// Logits rescale remainder (see [`AttentionWitness`]).
+    pub rem_log: Matrix,
 }
 
 /// Encode a signed integer into Goldilocks (negatives as the additive inverse).

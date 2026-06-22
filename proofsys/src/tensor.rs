@@ -113,6 +113,24 @@ impl Matrix {
                 .collect(),
         )
     }
+
+    /// Like [`floor_div_const`], but also returns the Euclidean remainder `r = x − divisor·q ∈
+    /// [0, divisor)` matrix. The remainder is exactly the rescale-fusion `in` column the unified
+    /// lookup needs, so retaining it here lets the prover/committer skip recomputing the full matmul
+    /// product `C = A·B` in `segment_columns`.
+    pub fn floor_div_const_with_rem(&self, divisor: i64) -> (Matrix, Matrix) {
+        let mut q = Vec::with_capacity(self.data.len());
+        let mut r = Vec::with_capacity(self.data.len());
+        for &x in &self.data {
+            let quo = floor_div_i128(x as i128, divisor as i128);
+            q.push(quo);
+            r.push(checked_i128_to_i64(x as i128 - quo as i128 * divisor as i128));
+        }
+        (
+            Matrix::new(self.rows, self.cols, q),
+            Matrix::new(self.rows, self.cols, r),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

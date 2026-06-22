@@ -224,15 +224,16 @@ impl ModelWeights {
             });
         }
         let lnf = layer_norm(&x, &self.ln_f_g, &self.ln_f_b);
-        let q_log = lnf
+        let (q_log, rem_log) = lnf
             .output
             .matmul_transposed_rhs(&self.wte)
-            .floor_div_const(config.scale);
+            .floor_div_const_with_rem(config.scale);
         Witness {
             x0,
             blocks,
             lnf,
             q_log,
+            rem_log,
         }
     }
 }
@@ -284,7 +285,7 @@ fn attention(
     weights: &ModelWeights,
     config: &Config,
 ) -> AttentionWitness {
-    let q_qkv = nx.matmul(&b.attn_w).floor_div_const(config.scale);
+    let (q_qkv, rem_qkv) = nx.matmul(&b.attn_w).floor_div_const_with_rem(config.scale);
     let qkv = q_qkv.add_row_vector(&b.attn_b);
     let (qs, ks, vs) = split_qkv_heads(&qkv, config);
 
@@ -294,17 +295,22 @@ fn attention(
     let mut sum_exp = Vec::with_capacity(config.n_head);
     let mut q_prob = Vec::with_capacity(config.n_head);
     let mut q_ao_heads = Vec::with_capacity(config.n_head);
+    let mut rem_sc = Vec::with_capacity(config.n_head);
+    let mut rem_ao_heads = Vec::with_capacity(config.n_head);
     let mut merged_ao = Matrix::zeros(config.n_seq, config.d_model);
 
     for h in 0..config.n_head {
         let q = qs.head_matrix(h);
         let k = ks.head_matrix(h);
         let v = vs.head_matrix(h);
-        let sc = q
+        let (sc, rsc) = q
             .matmul_transposed_rhs(&k)
-            .floor_div_const(config.sqrt_d_scale());
+            .floor_div_const_with_rem(config.sqrt_d_scale());
         let (xm, ex, se, prob) = softmax(&sc, weights, config);
-        let ao = prob.head_matrix(0).matmul(&v).floor_div_const(config.scale);
+        let (ao, rao) = prob
+            .head_matrix(0)
+            .matmul(&v)
+            .floor_div_const_with_rem(config.scale);
         for i in 0..config.n_seq {
             for d in 0..config.d_head {
                 merged_ao.set(i, h * config.d_head + d, ao.get(i, d));
@@ -316,11 +322,13 @@ fn attention(
         sum_exp.push(se);
         q_prob.push(prob);
         q_ao_heads.push(Tensor3::new(1, config.n_seq, config.d_head, ao.into_data()));
+        rem_sc.push(Tensor3::new(1, config.n_seq, config.n_seq, rsc.into_data()));
+        rem_ao_heads.push(Tensor3::new(1, config.n_seq, config.d_head, rao.into_data()));
     }
 
-    let q_apr = merged_ao
+    let (q_apr, rem_apr) = merged_ao
         .matmul(&b.attn_proj_w)
-        .floor_div_const(config.scale);
+        .floor_div_const_with_rem(config.scale);
     let projected = q_apr.add_row_vector(&b.attn_proj_b);
     let x_out = residual.add_matrix(&projected);
     AttentionWitness {
@@ -335,6 +343,10 @@ fn attention(
         q_ao: merged_ao,
         q_apr,
         x_out,
+        rem_qkv,
+        rem_sc,
+        rem_ao_heads,
+        rem_apr,
     }
 }
 
@@ -345,7 +357,7 @@ fn mlp(
     weights: &ModelWeights,
     config: &Config,
 ) -> MlpWitness {
-    let q_fc = nx.matmul(&b.fc_w).floor_div_const(config.scale);
+    let (q_fc, rem_fc) = nx.matmul(&b.fc_w).floor_div_const_with_rem(config.scale);
     let fc = q_fc.add_row_vector(&b.fc_b);
     let mut act = Matrix::zeros(config.n_seq, config.mlp_hidden);
     let offset = config.max_v * config.scale;
@@ -359,7 +371,7 @@ fn mlp(
             act.set(r, c, weights.gelu_lut[idx as usize]);
         }
     }
-    let q_fpr = act.matmul(&b.fproj_w).floor_div_const(config.scale);
+    let (q_fpr, rem_fpr) = act.matmul(&b.fproj_w).floor_div_const_with_rem(config.scale);
     let projected = q_fpr.add_row_vector(&b.fproj_b);
     let x_out = residual.add_matrix(&projected);
     MlpWitness {
@@ -368,6 +380,8 @@ fn mlp(
         act,
         q_fpr,
         x_out,
+        rem_fc,
+        rem_fpr,
     }
 }
 
