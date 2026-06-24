@@ -134,18 +134,32 @@ localized change since every gadget already emits `(commitment, point, value)` c
   a recomposition check). Every committed quotient also carries a limb quotient bound.
 - **sqrt** — `y²−y ≤ x ≤ y²+y` via an eq-weighted product (`y²`) and limb brackets.
 - **gelu** — indexed LUT (`act = GELU_LUT[fc + offset]`).
-- **unified lookup** — every range / LUT / limb query folds into **one** LogUp lookup against a
-  single `(in, out, type)` table; only the multiplicity vector `e` is committed online, the table
+- **softmax-max** — a **batched grand-product GKR** (`grandprod`/`maxprod`) proves
+  `∏_k(x_max − scores) = 0` per (head, row) in one pass against a public top vector; the masked
+  leaf opening is discharged by a key+row sumcheck reducing to `q_sc`/`x_max` openings.
+- **exp masked-index LUT** — `exp = EXP_LUT[idx]` with `idx = M∘(scores − x_max + offset)`, as a
+  unified-lookup segment; the masked index is reduced by one sumcheck (`prove_masked`) to
+  `q_sc`/`x_max` openings.
+- **sum-over-features / var_sum / sum_exp** (`sumfeat`) — `var_sum = D·Σx² − (Σx)²` and
+  `a_ln = g·(D·x − sum_x)` via column half-points + γ-RLC'd product sumchecks across the 25
+  LayerNorm instances; `sum_exp = Σ_k exp` via a key half-point on real rows. `sum_x`/`sum_x²` stay
+  virtual (no extra commitments).
+- **residual stream** (`residual`) — the LayerNorm input is the committed block output `x_out`
+  (or the public `x0`), resolved via fixed-instance slices; a batched affine check binds each
+  `x_out = x_in + projected + bias`.
+- **unified lookup** — every range / LUT / limb / exp query folds into **one** LogUp lookup against
+  a single `(in, out, type)` table; only the multiplicity vector `e` is committed online, the table
   side is public and verifier-reconstructed. The table is sized to the config.
 
 `model::forward` is the bit-exact integer reference that generates the witness. The pipeline
-(forward → commit → prove → verify) verifies on small and multi-layer/-head configs;
-`bench_faithful` reports prover/verifier time, transcript size, and Fiat-Shamir draw counts.
+(forward → commit → prove → verify) verifies on small, multi-layer/-head, and **full GPT-2**
+(12 layers, 144 heads, vocab 50257) configs; `bench_faithful` reports prover/verifier time,
+transcript size, and Fiat-Shamir draw counts (see [`proofsys/BENCH.md`](proofsys/BENCH.md)).
 
-> Status: the reductions above are implemented and accept/tamper-tested. Not yet wired (the
-> remaining soundness bindings): the softmax-max grand-product, the exp masked-index LUT, the
-> sum-over-features half-points / `var_sum` binding, and the residual-stream wiring. Full-scale
-> GPT-2 (12 layers, vocab 50257) is being brought up; small and multi-instance configs pass today.
+> Status: all gadget reductions — including the previously-unwired softmax-max grand-product, exp
+> masked-index LUT, sum-over-features / `var_sum` binding, and residual-stream wiring — are
+> implemented and accept/tamper-tested, and the full-scale GPT-2 proof verifies end to end. The PCS
+> is still the transparent `NoopPcs` (real Basefold binding is the remaining follow-on).
 
 ## PCS benchmarks (indicative)
 

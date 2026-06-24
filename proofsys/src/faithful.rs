@@ -43,6 +43,7 @@ const TYPE_RANGE12: u64 = 4;
 const TYPE_RANGE15: u64 = 5;
 const TYPE_RANGE13: u64 = 6;
 const TYPE_RANGE20: u64 = 7;
+const TYPE_EXP: u64 = 8;
 const TYPE_DUMMY: u64 = 99;
 
 const RANGE12_SIZE: usize = 4096;
@@ -106,8 +107,12 @@ fn fold_row(alpha: EF, input: EF, output: EF, ty: u64) -> EF {
 fn gelu_base(config: &Config) -> usize {
     limb16_base(config) + LIMB16_SIZE
 }
+/// The EXP_LUT sub-table base (after the GELU LUT). Indexed by the softmax exp index.
+fn exp_base(config: &Config, weights: &ModelWeights) -> usize {
+    gelu_base(config) + weights.gelu_lut.len()
+}
 fn table_len(config: &Config, weights: &ModelWeights) -> usize {
-    (gelu_base(config) + weights.gelu_lut.len()).next_power_of_two()
+    (exp_base(config, weights) + weights.exp_lut.len()).next_power_of_two()
 }
 
 /// The three unfolded public table columns `(in, out, type)` in row order. These are committed
@@ -142,6 +147,9 @@ fn table_columns(config: &Config, weights: &ModelWeights) -> (Vec<EF>, Vec<EF>, 
     }
     for (idx, &out) in weights.gelu_lut.iter().enumerate() {
         push(&mut cols, idx as u64, ef_i64(out), TYPE_GELU);
+    }
+    for (idx, &out) in weights.exp_lut.iter().enumerate() {
+        push(&mut cols, idx as u64, ef_i64(out), TYPE_EXP);
     }
     while cols.0.len() < len {
         let idx = cols.0.len() as u64;
@@ -191,6 +199,12 @@ enum SegKind {
         constant: EF,
         op: TypeBOp,
     },
+    /// Softmax exp masked-index LUT (one segment over the whole merged `EXP` cube): `in = Meff⊙(q_sc
+    /// − x_max + offset)` (the masked exp index), `out = EXP`. `Meff[row,key,head] =
+    /// (key ≤ row < n_seq)·(head < n_heads)` is the public causal-AND-real-head mask; off-mask /
+    /// padding vertices route to `EXP_LUT[0] = 0`. The masked product `Meff⊙(q_sc − x_max)` is
+    /// reduced by [`prove_masked`] (one sumcheck); only `offset·M̃eff` is added affinely.
+    MaskedLut { offset: u64 },
 }
 
 /// Identifies a Type-B division instance (softmax, per head) for the prover.
@@ -807,6 +821,17 @@ fn descriptors(config: &Config, weights: &ModelWeights) -> Vec<Descriptor> {
                 out: Some(ACT.to_owned()),
             },
         },
+        // Softmax exp masked-index LUT (one segment over the whole merged EXP cube).
+        Descriptor {
+            oracle_in: EXP.to_owned(),
+            ty: TYPE_EXP,
+            table_base: exp_base(config, weights),
+            vars: vars_of(EXP),
+            start: 0,
+            kind: SegKind::MaskedLut {
+                offset: (config.max_v * config.scale) as u64,
+            },
+        },
     ];
     // Each limb check contributes a LIMB16 range segment on its committed limb poly; the
     // recomposition tying the limbs to the target value is checked separately (see `recomps`).
@@ -898,6 +923,14 @@ pub struct UnifiedProof {
     /// Openings of the three committed public-table columns at the lookup's table point `z_t`,
     /// combined as `in + α·out + α²·type` to reconstruct the table value.
     pub table_cols: [EF; 3],
+    /// Residual-identity binding: each `x_out` = `x_in + projected + bias` (plan Phase 1).
+    pub xout_residual: crate::residual::XOutResidualProof,
+    /// Sum-over-features / `var_sum` + `sum_exp` bindings (plan Phase 2).
+    pub sumfeat: crate::sumfeat::SumFeatProof,
+    /// Softmax-max grand-product binding (plan Phase 3).
+    pub softmax_max: crate::maxprod::SoftmaxMaxProof,
+    /// Exp masked-index LUT reduction (plan Phase 4).
+    pub masked: MaskedLutProof,
     pub batch: <Pcs as PolyCommitmentScheme>::Proof,
 }
 
@@ -923,6 +956,10 @@ impl UnifiedProof {
             }
             s += ef * (r.openings.len() + r.limb_values.len());
         }
+        s += self.xout_residual.size_bytes();
+        s += self.sumfeat.size_bytes();
+        s += self.softmax_max.size_bytes();
+        s += self.masked.size_bytes();
         s
     }
 }
@@ -1071,8 +1108,79 @@ fn segment_columns(
                 indices[i] = d.table_base + ef_to_u64(v) as usize;
             }
         }
+        SegKind::MaskedLut { offset } => {
+            // in = Meff·(q_sc − x_max + offset), out = exp, over the whole merged EXP cube.
+            let lay = canonical::layout_for(config, EXP);
+            let (row_pow, col_pow) = (lay.row_pow, lay.col_pow);
+            let elem_len = row_pow * col_pow;
+            let n_heads = config.n_layer * config.n_head;
+            let q_sc = &set.prover_data(crate::canonical::Q_SC).unwrap().0;
+            let exp = &set.prover_data(EXP).unwrap().0;
+            let x_max = &set.prover_data(crate::canonical::X_MAX).unwrap().0;
+            let xmax_row_pow = canonical::layout_for(config, crate::canonical::X_MAX).row_pow;
+            for i in 0..len {
+                let head = i / elem_len;
+                let row = (i / col_pow) % row_pow;
+                let key = i % col_pow;
+                out_vals[i] = exp[i];
+                let v = if head < n_heads && row < config.n_seq && key <= row {
+                    q_sc[i] - x_max[head * xmax_row_pow + row] + ef_u64(*offset)
+                } else {
+                    EF::ZERO
+                };
+                in_vals[i] = v;
+                indices[i] = d.table_base + ef_to_u64(v) as usize;
+            }
+        }
     }
     (in_vals, out_vals, indices)
+}
+
+/// `M̃eff(point) = M̃(key,row)·realhead̃(head)`, the public causal-AND-real-head mask MLE over the
+/// EXP cube `(key ++ row ++ head)`. Separable (no shared variable), so it is a product of two cheap
+/// MLE evaluations.
+fn masked_lut_mask_eval(config: &Config, point: &[EF]) -> EF {
+    let lay = canonical::layout_for(config, EXP);
+    let (col_vars, row_vars) = (lay.col_vars(), lay.row_vars());
+    let (row_pow, col_pow) = (lay.row_pow, lay.col_pow);
+    let n_heads = config.n_layer * config.n_head;
+    // M[row,key] over (key ++ row).
+    let mut mkr = vec![EF::ZERO; col_pow * row_pow];
+    for r in 0..config.n_seq {
+        for k in 0..=r {
+            mkr[r * col_pow + k] = EF::ONE;
+        }
+    }
+    let m = MlPoly(mkr).eval(&point[..col_vars + row_vars]);
+    // realhead[head].
+    let inst_pow = 1usize << lay.inst_vars();
+    let mut rh = vec![EF::ZERO; inst_pow];
+    for h in 0..n_heads {
+        rh[h] = EF::ONE;
+    }
+    m * MlPoly(rh).eval(&point[col_vars + row_vars..])
+}
+
+/// The public masked-index sumcheck weight `eq(local, i)·Meff(i)` over the EXP cube — rebuilt
+/// identically by prover and verifier (the `eq·mask` MLE has no closed-form product, like the eq
+/// factor in [`crate::reduce::verify_prod`]).
+fn masked_weight(config: &Config, local: &[EF]) -> Vec<EF> {
+    let lay = canonical::layout_for(config, EXP);
+    let (row_pow, col_pow) = (lay.row_pow, lay.col_pow);
+    let elem_len = row_pow * col_pow;
+    let full = 1usize << lay.num_vars();
+    let n_heads = config.n_layer * config.n_head;
+    let eqv = eq_weights(local, full);
+    let mut w = vec![EF::ZERO; full];
+    for i in 0..full {
+        let head = i / elem_len;
+        let row = (i / col_pow) % row_pow;
+        let key = i % col_pow;
+        if head < n_heads && row < config.n_seq && key <= row {
+            w[i] = eqv[i];
+        }
+    }
+    w
 }
 
 /// Bias value at boolean vertex `i`. At a boolean point `MlPoly(values).eval` is just an array
@@ -1313,6 +1421,98 @@ fn verify_typeb_batch(
     true
 }
 
+/// The exp masked-index LUT reduction (plan Phase 4): the masked product `Meff⊙(q_sc − x_max)` at
+/// the unified-lookup point, plus the `Q_SC`/`X_MAX` openings its sumcheck reduces to.
+pub struct MaskedLutProof {
+    pub claim: EF,
+    pub sumcheck: SumcheckProof<EF>,
+    pub q_sc: EF,
+    pub x_max: EF,
+}
+
+impl MaskedLutProof {
+    pub fn size_bytes(&self) -> usize {
+        3 * core::mem::size_of::<EF>() + self.sumcheck.size_bytes()
+    }
+}
+
+/// The masked exp index `local` point: the unified-lookup point restricted to the EXP segment's
+/// variables `(key ++ row ++ head)`.
+fn masked_local(config: &Config, zq: &[EF]) -> Vec<EF> {
+    zq[..canonical::layout_for(config, EXP).num_vars()].to_vec()
+}
+
+/// Prove `claim = (Meff⊙(q_sc − x_max))(local)` via one sumcheck over the EXP cube, emitting the
+/// reduced `Q_SC`/`X_MAX` openings. (`offset·M̃eff` is added affinely by the verifier.)
+fn prove_masked(
+    set: &CommitSet,
+    config: &Config,
+    zq: &[EF],
+    acc: &mut ClaimAccumulator,
+    oracle: &mut RandomOracle<EF>,
+) -> MaskedLutProof {
+    let lay = canonical::layout_for(config, EXP);
+    let col_vars = lay.col_vars();
+    let (row_pow, col_pow) = (lay.row_pow, lay.col_pow);
+    let elem_len = row_pow * col_pow;
+    let full = 1usize << lay.num_vars();
+    let n_heads = config.n_layer * config.n_head;
+    let local = masked_local(config, zq);
+    let _ = n_heads;
+    let q_sc = &set.prover_data(crate::canonical::Q_SC).unwrap().0;
+    let x_max = &set.prover_data(crate::canonical::X_MAX).unwrap().0;
+    let xmax_row_pow = canonical::layout_for(config, crate::canonical::X_MAX).row_pow;
+    let mut operand = vec![EF::ZERO; full];
+    for i in 0..full {
+        let head = i / elem_len;
+        let row = (i / col_pow) % row_pow;
+        operand[i] = q_sc[i] - x_max[head * xmax_row_pow + row];
+    }
+    let weight = masked_weight(config, &local);
+    let claim = weight.iter().zip(&operand).fold(EF::ZERO, |a, (&w, &o)| a + w * o);
+    let (sumcheck, sc) = sumcheck::prove(vec![weight, operand], oracle);
+    let red = reduce::low_first(&sc); // (key ++ row ++ head)
+    let q_sc_v = set.prover_data(crate::canonical::Q_SC).unwrap().clone().eval(&red);
+    acc.open(crate::canonical::Q_SC, red.clone(), q_sc_v);
+    let xm_pt = red[col_vars..].to_vec(); // (row ++ head)
+    let x_max_v = set.prover_data(crate::canonical::X_MAX).unwrap().clone().eval(&xm_pt);
+    acc.open(crate::canonical::X_MAX, xm_pt, x_max_v);
+    MaskedLutProof { claim, sumcheck, q_sc: q_sc_v, x_max: x_max_v }
+}
+
+/// Verify the masked exp index reduction: check the sumcheck (claim public from the proof, used by
+/// the recon loop), the public weight terminal, and emit the `Q_SC`/`X_MAX` openings.
+fn verify_masked(
+    proof: &MaskedLutProof,
+    config: &Config,
+    zq: &[EF],
+    acc: &mut ClaimAccumulator,
+    oracle: &mut RandomOracle<EF>,
+) -> bool {
+    let lay = canonical::layout_for(config, EXP);
+    let col_vars = lay.col_vars();
+    let local = masked_local(config, zq);
+    let Some(sc) = sumcheck::verify(proof.claim, &proof.sumcheck, oracle) else {
+        return false;
+    };
+    if proof.sumcheck.final_evals.len() != 2 {
+        return false;
+    }
+    let red = reduce::low_first(&sc);
+    // weight(red): the public `eq(local,·)·Meff` vector's MLE (rebuilt, like `verify_prod`'s eq).
+    let w_term = MlPoly(masked_weight(config, &local)).eval(&red);
+    if proof.sumcheck.final_evals[0] != w_term {
+        return false;
+    }
+    // operand(red) = q_sc(red) − x_max(red[col..]).
+    if proof.sumcheck.final_evals[1] != proof.q_sc - proof.x_max {
+        return false;
+    }
+    acc.open(crate::canonical::Q_SC, red.clone(), proof.q_sc);
+    acc.open(crate::canonical::X_MAX, red[col_vars..].to_vec(), proof.x_max);
+    true
+}
+
 pub fn prove(
     set: &CommitSet,
     config: &Config,
@@ -1372,6 +1572,14 @@ pub fn prove(
                 }
                 EF::ZERO // unused for TypeB (in is reconstructed from the batched prod + linears)
             }
+            SegKind::MaskedLut { .. } => {
+                // out = exp at the (full) segment point; in is reconstructed from the masked-index
+                // sumcheck (`prove_masked`, after this loop) + the public `offset·M̃eff`.
+                let ov = set.prover_data(EXP).unwrap().clone().eval(&local);
+                acc.open(EXP, local.clone(), ov);
+                out_value = Some(ov);
+                EF::ZERO
+            }
         };
         segment_openings.push(SegmentOpening {
             in_value,
@@ -1384,6 +1592,9 @@ pub fn prove(
     // Batched Type-B softmax-division product: all heads' `q_prob·sum_exp` at the shared lookup
     // point in one sumcheck. Drawn after the per-segment matmul sumchecks, before the recomps.
     let typeb = prove_typeb_batch(set, config, witness, &zq, &mut acc, oracle);
+
+    // Exp masked-index LUT reduction (plan Phase 4): the masked product at the lookup point.
+    let masked = prove_masked(set, config, &zq, &mut acc, oracle);
 
     // Limb-recomposition checks (LayerNorm `// std` remainder, sqrt lower bracket) at fresh points.
     let mut recomps = Vec::new();
@@ -1420,6 +1631,16 @@ pub fn prove(
         });
     }
 
+    // Residual-identity binding (plan Phase 1): each committed `x_out = x_in + projected + bias`.
+    let xout_residual =
+        crate::residual::prove_xout_residual(set, config, weights, witness, &mut acc, oracle);
+
+    // Sum-over-features / var_sum + sum_exp bindings (plan Phase 2).
+    let sumfeat = crate::sumfeat::prove_sumfeat(set, config, weights, witness, &mut acc, oracle);
+
+    // Softmax-max grand-product binding (plan Phase 3).
+    let softmax_max = crate::maxprod::prove_softmax_max(set, config, &mut acc, oracle);
+
     // Public table columns + multiplicity `e`, opened at the lookup's table point `z_t`.
     let table_cols = [TABLE_IN, TABLE_OUT, TABLE_TYPE].map(|name| {
         let v = set.prover_data(name).unwrap().clone().eval(&zt);
@@ -1441,6 +1662,10 @@ pub fn prove(
         typeb,
         recomps,
         table_cols,
+        xout_residual,
+        sumfeat,
+        softmax_max,
+        masked,
         batch: Pcs::batch_prove(&tasks, oracle),
     }
 }
@@ -1464,6 +1689,7 @@ pub fn verify(
     set: &CommitSet,
     config: &Config,
     weights: &ModelWeights,
+    x0: &Matrix,
     proof: &UnifiedProof,
     oracle: &mut RandomOracle<EF>,
 ) -> bool {
@@ -1548,6 +1774,15 @@ pub fn verify(
                 }
                 v
             }
+            SegKind::MaskedLut { offset } => {
+                // out = exp opening; in = masked.claim + offset·M̃eff(local). The masked product is
+                // verified once after this loop (`verify_masked`).
+                let Some(ov) = opening.out_value else {
+                    return false;
+                };
+                acc.open(EXP, local.clone(), ov);
+                proof.masked.claim + ef_u64(*offset) * masked_lut_mask_eval(config, &local)
+            }
         };
         let out_full = opening.out_value.unwrap_or(EF::ZERO);
         recon += segment_selector(zq, d.start, d.vars) * fold_row(alpha, in_full, out_full, d.ty);
@@ -1564,6 +1799,11 @@ pub fn verify(
 
     // Batched Type-B product (all heads), drawn after the per-segment matmul sumchecks.
     if !verify_typeb_batch(&proof.typeb, config, zq, &mut acc, oracle) {
+        return false;
+    }
+
+    // Exp masked-index LUT reduction (plan Phase 4), drawn right after the Type-B product.
+    if !verify_masked(&proof.masked, config, zq, &mut acc, oracle) {
         return false;
     }
 
@@ -1600,6 +1840,25 @@ pub fn verify(
         if recomp_val != target {
             return false;
         }
+    }
+
+    // Residual-identity binding (plan Phase 1).
+    if !crate::residual::verify_xout_residual(
+        &proof.xout_residual, config, weights, x0, &mut acc, oracle,
+    ) {
+        return false;
+    }
+
+    // Sum-over-features / var_sum + sum_exp bindings (plan Phase 2).
+    if !crate::sumfeat::verify_sumfeat(
+        &proof.sumfeat, set, config, weights, x0, &mut acc, oracle,
+    ) {
+        return false;
+    }
+
+    // Softmax-max grand-product binding (plan Phase 3).
+    if !crate::maxprod::verify_softmax_max(&proof.softmax_max, set, config, &mut acc, oracle) {
+        return false;
     }
 
     acc.open(E, mult.point.clone(), mult.value);
@@ -1744,7 +2003,7 @@ mod tests {
         let mut oracle = RandomOracle::<EF>::new(&mut rng);
         let proof = prove(&canon.set, &cfg, &weights, &witness, &mut oracle);
         oracle.restart();
-        assert!(verify(&canon.set, &cfg, &weights, &proof, &mut oracle));
+        assert!(verify(&canon.set, &cfg, &weights, &witness.x0, &proof, &mut oracle));
     }
 
     #[test]
@@ -1756,7 +2015,7 @@ mod tests {
         let mut oracle = RandomOracle::<EF>::new(&mut rng);
         let proof = prove(&canon.set, &cfg, &weights, &witness, &mut oracle);
         oracle.restart();
-        assert!(verify(&canon.set, &cfg, &weights, &proof, &mut oracle));
+        assert!(verify(&canon.set, &cfg, &weights, &witness.x0, &proof, &mut oracle));
     }
 
     #[test]
@@ -1768,6 +2027,6 @@ mod tests {
         let mut oracle = RandomOracle::<EF>::new(&mut rng);
         let proof = prove(&canon.set, &cfg, &weights, &witness, &mut oracle);
         oracle.restart();
-        assert!(verify(&canon.set, &cfg, &weights, &proof, &mut oracle));
+        assert!(verify(&canon.set, &cfg, &weights, &witness.x0, &proof, &mut oracle));
     }
 }

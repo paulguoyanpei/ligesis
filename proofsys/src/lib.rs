@@ -6,9 +6,13 @@
 pub mod canonical;
 pub mod commit;
 pub mod faithful;
+pub mod grandprod;
+pub mod maxprod;
 pub mod model;
 pub mod protocol;
 pub mod reduce;
+pub mod residual;
+pub mod sumfeat;
 pub mod tensor;
 pub mod witness;
 

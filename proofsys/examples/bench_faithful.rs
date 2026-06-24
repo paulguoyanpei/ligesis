@@ -58,7 +58,7 @@ fn main() {
 
     oracle.restart();
     let t = Instant::now();
-    let ok = faithful::verify(&canon.set, &config, &weights, &proof, &mut oracle);
+    let ok = faithful::verify(&canon.set, &config, &weights, &witness.x0, &proof, &mut oracle);
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     println!("offline_commit_ms={offline_commit_ms:.3}");
